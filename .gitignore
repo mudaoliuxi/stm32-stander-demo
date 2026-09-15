@@ -1,55 +1,46 @@
-# Prerequisites
+# Keil MDK-ARM 工程忽略规则
+
+# 忽略所有构建输出目录（通常命名为Debug, Release, Output等，或者自定义的build目录）
+[Dd]ebug/
+[Rr]elease/
+[Oo]utput/
+[Bb]uild/
+
+# 忽略Keil生成的对象文件和依赖文件
+*.o
 *.d
 
-# Object files
-*.o
-*.ko
-*.obj
+# 忽略可执行文件
+*.axf
 *.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
 *.hex
+*.bin
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# 忽略Keil工程相关的临时文件
+*.dep
+*.crf
+*.lst
+*.map
+*.lnp
+*.tracesession
+*.iex
+*.htm
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# 忽略日志文件
+*.log
+JLinkLog.txt
 
-# debug information files
-*.dwo
+# 忽略IDE备份文件
+*.bak
+
+# 忽略用户特定的调试配置文件
+*.ini
+*.scvd
+
+# 忽略版本控制软件产生的文件（如TortoiseGit等）
+*.gitignore
+*.gitattributes
+.git/
+
+# 忽略其他临时文件
+*.tmp
