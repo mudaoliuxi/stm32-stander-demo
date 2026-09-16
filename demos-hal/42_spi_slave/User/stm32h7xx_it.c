@@ -22,6 +22,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32h7xx_hal.h"
 #include "stm32h7xx_it.h"
+#include "main.h"                       /* SPI2句柄/引脚定义 */
 
 
 /** @addtogroup STM32H7xx_HAL_Examples
@@ -155,6 +156,32 @@ void SysTick_Handler(void)
   * @param  None
   * @retval None
   */
+/**
+  * @brief  EXTI15_10中断服务函数: SPI2 NSS(PB12)上升沿 => 一帧结束
+  *         调用HAL库EXTI公共处理, 最终进入main.c的HAL_GPIO_EXTI_Callback()
+  */
+void EXTI15_10_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(SPI2_NSS_PIN);
+}
+
+/**
+  * @brief  DMA1 Stream0中断服务函数: SPI2 RX DMA
+  */
+void DMA1_Stream0_IRQHandler(void)
+{
+    /* 本工程不使用DMA中断(帧边界由NSS的EXTI判定), 空函数只为占住向量表 */
+}
+
+/**
+  * @brief  DMA1 Stream1中断服务函数: SPI2 TX DMA
+  */
+void DMA1_Stream1_IRQHandler(void)
+{
+    /* 本工程不使用DMA中断(帧边界由NSS的EXTI判定), 空函数只为占住向量表 */
+}
+
+
 /*void PPP_IRQHandler(void)
 {
 }*/
