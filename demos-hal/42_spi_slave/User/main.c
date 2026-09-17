@@ -102,7 +102,11 @@
      那是V1.5的试验项, 上板未验证, 默认开着只会让问题更难定位。 */
 #define SPI_NSS_MODE            1
 
-/* Master读走的应答内容: 16个 0xA5 */
+/* Master读走的应答内容: 16个 0xA5
+   [!] 若心跳里 UDR 每帧+1, 说明 Master 读的字节数 >= 从机 TX 准备的长度,
+       TX FIFO 被读空 -> 欠载。数据本身仍正确(补发内容由 CFG1.UDRCFG 决定),
+       想让 UDR 归零: 把下面长度改成 SPI_RX_BUF_SIZE, 并把 g_spi_tx_buf 同步改大。
+       先用分类计数确认到底是不是 UDR, 别猜。 */
 #define SPI_TX_REPLY_BYTE       0xA5
 #define SPI_TX_PATTERN_LEN      16
 
@@ -138,7 +142,10 @@ volatile uint8_t  g_spi_frame_ready = 0;        /* 1 = 有新帧待打印             
 volatile uint16_t g_spi_frame_len   = 0;        /* 新帧长度                                     */
 volatile uint32_t g_spi_irq_cnt     = 0;        /* NSS上升沿(EXTI)次数                          */
 volatile uint32_t g_spi_drop_cnt    = 0;        /* 空帧丢弃次数(多半是NSS线上的毛刺)            */
-volatile uint32_t g_spi_err_cnt     = 0;        /* SPI OVR/UDR/FRE 错误次数                     */
+volatile uint32_t g_spi_err_cnt     = 0;        /* SPI OVR/UDR/FRE 错误总数                     */
+volatile uint32_t g_spi_ovr_cnt     = 0;        /* RX FIFO 溢出 Overrun  (接收侧真故障, 该恒0)  */
+volatile uint32_t g_spi_udr_cnt     = 0;        /* TX FIFO 欠载 Underrun (从机TX给少了会这样)   */
+volatile uint32_t g_spi_fre_cnt     = 0;        /* 帧错误 TIFRE          (非TI模式应恒为0)      */
 
 static const char g_hex_tab[16] = "0123456789ABCDEF";
 
@@ -418,13 +425,26 @@ static void spi_frame_close(void)
     /* 3. 算本帧长度: NORMAL模式下NDTR从 SIZE 一路递减, 收到几个字节就减几 */
     len = (uint16_t)(SPI_RX_BUF_SIZE - (uint16_t)DMA1_Stream0->NDTR);
 
-    /* 4. SPI错误统计(溢出/欠载/帧错误), 顺手清标志 */
-    if ((SPI2->SR & (SPI_SR_OVR | SPI_SR_UDR | SPI_SR_TIFRE)) != 0UL)
+    /* 4. SPI错误统计 —— 分类计数, 一眼看出是哪种。
+     *    OVR: RX FIFO 满了但没被DMA及时搬走 (接收侧真故障, 该恒为0)
+     *    UDR: 从机被选中要发数据时 TX FIFO 是空的。从机 TX 只准备了固定长度,
+     *         而 Master 读得比它多, 就会 UDR —— 属"正常但要知道"的现象,
+     *         补发什么由 CFG1.UDRCFG 决定; 想让它归零就得把 TX 长度给满。
+     *    FRE: TI 模式专用, 本工程恒为 0。                                    */
     {
-        g_spi_err_cnt++;
-        __HAL_SPI_CLEAR_OVRFLAG(&g_spi2_handle);
-        __HAL_SPI_CLEAR_UDRFLAG(&g_spi2_handle);
-        __HAL_SPI_CLEAR_FREFLAG(&g_spi2_handle);
+        uint32_t sr = SPI2->SR;
+
+        if ((sr & SPI_SR_OVR)   != 0UL) { g_spi_ovr_cnt++; }
+        if ((sr & SPI_SR_UDR)   != 0UL) { g_spi_udr_cnt++; }
+        if ((sr & SPI_SR_TIFRE) != 0UL) { g_spi_fre_cnt++; }
+
+        if ((sr & (SPI_SR_OVR | SPI_SR_UDR | SPI_SR_TIFRE)) != 0UL)
+        {
+            g_spi_err_cnt++;
+            __HAL_SPI_CLEAR_OVRFLAG(&g_spi2_handle);
+            __HAL_SPI_CLEAR_UDRFLAG(&g_spi2_handle);
+            __HAL_SPI_CLEAR_FREFLAG(&g_spi2_handle);
+        }
     }
 
     /* 5. 取本帧数据(DMA写的是AXI SRAM, CPU读前必须先失效Cache) */
@@ -515,7 +535,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.1 每帧独立+收完即清空) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.2 每帧独立+收完即清空) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
@@ -593,10 +613,11 @@ int main(void)
         {
             tick_diag = HAL_GetTick();
 
-            printf("[心跳] %lu s | NSS边沿=%lu 有效帧=%lu 空帧=%lu SPI错误=%lu | SPI_EN=%d\r\n",
+            printf("[心跳] %lu s | NSS=%lu 帧=%lu 空=%lu | 错 OVR=%lu UDR=%lu FRE=%lu | SPI_EN=%d\r\n",
                    (unsigned long)(HAL_GetTick() / 1000UL), (unsigned long)g_spi_irq_cnt,
                    (unsigned long)diag_ok, (unsigned long)g_spi_drop_cnt,
-                   (unsigned long)g_spi_err_cnt,
+                   (unsigned long)g_spi_ovr_cnt, (unsigned long)g_spi_udr_cnt,
+                   (unsigned long)g_spi_fre_cnt,
                    ((SPI2->CR1 & SPI_CR1_SPE) != 0UL) ? 1 : 0);
         }
     }
