@@ -309,7 +309,35 @@ L6047U: The size of this image (xxxxx bytes) exceeds the maximum allowed for thi
 | **V2.0** | **回归简单：每帧独立 + 收完即清空**。①DMA 从 `CIRCULAR` 改回 **`NORMAL`**，每帧结束重装 `NDTR`/地址，从 `缓冲[0]` 重新开始写 —— 物理上杜绝"上一帧残留混进本帧"；②帧结束**把 RX 缓冲整块清零**再重装，这就是"每次接收都清空"；③帧长直接 `len = 大小 − NDTR`，不再用两次 NDTR 差值；④自写 `dma_stream_reload()`（停流后**等 `EN` 真为 0** 再写 `NDTR`，绕开 `HAL_SPI_DMAStop()` 空壳坑）；⑤**砍掉诊断花活**（信号线自检、位对齐自诊断、毛刺帧过滤、超长帧计数），代码 776→598 行，镜像 31908→**27868 字节**，MDK-Lite 余量 772→**4900 字节** |
 | **V2.1** | **消除死等 + 加心跳 + NSS 退回软件模式**。①`dma_stream_reload()` 与 `spi_frame_close()` 里三处 `while (EN 位)` **裸死等全部加超时** —— 原来一旦 DMA 流因外设请求异常挂住，程序会在**最高优先级中断里永久卡死、串口彻底静默**；②主循环新增**每 2 秒无条件心跳**（`[心跳] ... 秒 | NSS边沿 | 有效帧 | 空帧 | SPI错误 | SPI_EN`），用于一刀切开"程序死了"和"没数据"；③`SPI_NSS_MODE` 默认由 `0`（硬件 NSS）**退回 `1`（软件 NSS）** —— 软件 NSS 才是 V1.4 实测跑通的路径，硬件 NSS 属 V1.5 未验证的试验项 |
 | **V2.2** | **SPI 错误分类统计**。原来只有一个 `SPI错误` 总数，看不出是哪种；现在拆成 `OVR`（RX FIFO 溢出）/ `UDR`（TX FIFO 欠载）/ `FRE`（TI 帧错误）三项，心跳里分别显示。实测每帧 +1 的是 **`UDR`** —— 从机 TX 只准备 16 字节、Master 读满 16 字节后 FIFO 被读空，属预期现象，数据不受影响（详见 4.4） |
+| **V2.7** | **取反回环协议**：每帧结束时把收到的数据按位取反写回 `g_spi_tx_buf`，下一帧回发（长度=上一帧长度，上限32）。上电默认仍回发 16×0xA5。配套 Master 端 `spi_stress_test.sh` 链式校验（轮 N 期望 = 轮 N-1 所发取反），任一轮不符立即停止。编译 0E/0W，镜像 28288B |
+| **V2.8** | **装载调试快照**：帧关闭后在主循环里打印 `[装载#N]` 行，含 `g_spi_tx_buf` 前 8 字节、`DMA1_Stream1` 的 `CR/PAR/M0AR/NDTR`、`SPI SR/CR1`。目的：验证取反路径是否真的写进 TX 缓冲、DMA 是否按预期重装、FIFO 状态。实测三次运行：第一/二次 Master 仍读到 16×A5（=FIFO 里上一帧 DMA 灌进去的 A5 残留），第三次终于读到 `A5 + FF FE FD…F1`（取反字节少 1，FIFO 头部还残留 1 个 A5）→ **取反逻辑 100% 正确，问题在 FIFO 残留** |
+| **V2.9** | **根治 TX FIFO 残留：帧关闭时 SPE=0→1 冲掉 FIFO**。V2.8 的快照证明 TX DMA 在 NSS 有效期间持续灌 `g_spi_tx_buf`（初始 A5）进 FIFO，`frame_close()` 改 M0AR 时 FIFO 已被 16×A5 占满；Master 必须先把这 16 个 A5 抽完才有位置进新数据 → 取反数据比预期晚 1 帧到位且末位被截。修复：`spi_frame_close()` 在 RX 清零之后、TX DMA reload 之前，**显式 `__HAL_SPI_DISABLE` 再 `__HAL_SPI_ENABLE`**。H7 没有专门的 TX FIFO flush 位，`SPE=0` 会复位内部 FIFO（NSS 高电平期间 Master 不打 SCK，关/开 SPE 不丢数据）。编译 0E/0W，镜像 **27392B**（比 V2.8 还省 1.3KB，MDK-Lite 余量恢复） |
 
+
+### V2.9 (2026-09-17 21:00) - SPE toggle 冲掉 TX FIFO 残留
+
+**V2.8 实测 (10MHz)**：Master 连跑三次同命令：
+```
+Run 1: RX = A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5   ← 初始 A5
+Run 2: RX = A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5   ← 仍是 A5??
+Run 3: RX = A5 FF FE FD FC FB FA F9 F8 F7 F6 F5 F4 F3 F2 F1   ← A5 + 15 个取反字节 (缺末位 F0)
+```
+三次串口快照里 `TX=FF FE FD…F8`（取反后的内容）、`PAR=40003820`（`SPI2->TXDR`）、`M0AR=24000400`（`g_spi_tx_buf`）全部对的上，但 Master 读到的字节被延迟一拍半。
+
+**根因**：TX DMA 在 NSS 有效期间 **不会停**，持续把 `g_spi_tx_buf`（前 16 字节 = A5）灌进 SPI 的 TX FIFO。`frame_close()` 在 NSS 上升沿改 M0AR、改 NDTR、改缓冲内容——**但 FIFO 里已经被 16 个 A5 占满**，新数据要等 FIFO 空了再填。
+
+| 时刻 | FIFO 实际内容 | Master 实际读到 |
+|---|---|---|
+| 上电 → Run 1 前 | A5×16 | — |
+| Run 1 进行中 | FIFO 被 Master 抽走，DMA 持续灌 A5 | A5×16 |
+| Run 1 结束 (NSS↑) | `frame_close` 改 M0AR、改缓冲为取反数据 | — |
+| **Run 2 进行中** | **DMA 仍在推旧数据（NDTR=16 之前那一轮 A5 灌满 FIFO）** | **A5×16** |
+| Run 2 结束 (NSS↑) | 再次 reload | — |
+| **Run 3 进行中** | FIFO 头部残留 1 个 A5，DMA 灌入 15 个取反字节 | **A5 + FF…F1** |
+
+**修复**：`spi_frame_close()` 在 RX 清零之后、TX DMA reload 之前，**显式把 SPI 的 SPE 关掉再打开**。H7 没有专门的 TX FIFO flush 位，`SPE=0` 会复位内部 FIFO；NSS 高电平期间 Master 不打 SCK，关/开 SPE 不丢任何数据。这是 V1.x "永关 SPE" 原则的反例——以前怕关 SPE 后 FIFO 不清，现在反过来故意用关 SPE 来清 FIFO。
+
+**验证 (待用户)**：重烧 V2.9 后再连跑三次，期望每次 Run N 都立刻读到取反数据，无需等待。
 
 ### V2.7 (2026-09-17 19:55) - 取反回环: 下一帧回发本帧数据的按位取反
 

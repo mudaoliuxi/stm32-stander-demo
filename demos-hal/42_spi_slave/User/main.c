@@ -152,6 +152,10 @@ volatile uint32_t g_spi_ovr_cnt     = 0;        /* RX FIFO 溢出 Overrun  (接收侧
 volatile uint32_t g_spi_udr_cnt     = 0;        /* TX FIFO 欠载 Underrun (从机TX给少了会这样)   */
 volatile uint32_t g_spi_fre_cnt     = 0;        /* 帧错误 TIFRE          (非TI模式应恒为0)      */
 volatile uint32_t g_spi_nss_glitch_cnt = 0;     /* NSS上升沿毛刺次数(EXTI触发时引脚已是低电平)  */
+volatile uint32_t g_tx_load_cnt = 0;            /* V2.8调试: 帧关闭里TX重装次数                  */
+volatile uint8_t  g_tx_snap[8] = {0};           /* V2.8调试: 重装时刻TX缓冲前8字节               */
+volatile uint32_t g_s1_cr = 0, g_s1_par = 0, g_s1_m0ar = 0, g_s1_ndtr = 0; /* V2.8调试: DMA流1实况 */
+volatile uint32_t g_sr_snap = 0, g_cr1_snap = 0; /* V2.8调试: 重装时刻 SPI SR / CR1              */
 
 static const char g_hex_tab[16] = "0123456789ABCDEF";
 
@@ -475,6 +479,10 @@ static void spi_frame_close(void)
         {
             g_spi_tx_buf[i] = (uint8_t)~g_spi_frame_buf[i];
         }
+        /* V2.9: 清零尾部。g_spi_tx_buf 整段 32 字节必须显式置 0,
+         * 否则若 g_spi_tx_reply_len 因某种原因变小, 残余字节仍指向上一帧的"上半段"
+         * 数据(FIFO 仍残留 A5), 喂给下一帧末尾。
+         * 看似多余但实测这一行决定了"末位 F0"能不能送出去。                  */
         for (i = n; i < 32U; i++)
         {
             g_spi_tx_buf[i] = 0x00;
@@ -491,9 +499,39 @@ static void spi_frame_close(void)
     memset((void *)g_spi_rx_buf, 0, sizeof(g_spi_rx_buf));
     SCB_CleanDCache_by_Addr((uint32_t *)g_spi_rx_buf, (int32_t)sizeof(g_spi_rx_buf));
 
+    /* V2.9: ★ 清 SPI TX FIFO (冲掉上一帧残留的 A5)。
+     *
+     * 旧逻辑只在 EXTI(帧结束)里改 M0AR 指向"取反缓冲", 但 TX DMA 在 NSS 有效期间
+     * 持续灌 g_spi_tx_buf 进 FIFO。Frame N 期间 DMA 一直在推 g_spi_tx_buf 的前
+     * 16 字节(初始是 A5), 等到 frame_close 改 M0AR 时 FIFO 里已经被 16 个 A5 占满,
+     * 取反数据必须等 A5 被 Master 抽走才有位置进 FIFO, 结果:
+     *     - Frame N+1 读到 16×A5 (仍是上一轮的残留)
+     *     - Frame N+2 读到 1×A5 + 15 个取反字节 (末位 F0 被截)
+     *
+     * 取反数据已经在 g_spi_tx_buf 里(步骤 5.5), 现在要做的只是把 FIFO 里残留的
+     * 旧字节冲掉。
+     *
+     * 清 TX FIFO: H7 没有专门的 flush 位, 但 SPE=0 会复位内部状态机与 FIFO。
+     * NSS 高电平期间 (frame_close 一定在这里跑) Master 不打 SCK,
+     * 关一下再开 SPE 不会丢任何数据。
+     * "永关 SPE"是 V1.x 的旧规则, 目的是"避免关 SPE 后 TX FIFO 不清的副作用"——
+     * 现在反其道而行, 故意用 SPE 关闭来清 FIFO。                                    */
+    __HAL_SPI_DISABLE(&g_spi2_handle);
+    __HAL_SPI_ENABLE(&g_spi2_handle);
+
     /* 7. 重装两路DMA: 下一帧从 缓冲[0] 重新开始收 */
     dma_stream_reload(DMA1_Stream0, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
     dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, g_spi_tx_reply_len);
+
+    /* 7.5 V2.8调试快照: 重装后的TX缓冲内容 / DMA流1实况 / SPI状态, 由主循环打印 */
+    g_tx_load_cnt++;
+    for (i = 0U; i < 8U; i++) { g_tx_snap[i] = g_spi_tx_buf[i]; }
+    g_s1_cr    = DMA1_Stream1->CR;
+    g_s1_par   = DMA1_Stream1->PAR;
+    g_s1_m0ar  = DMA1_Stream1->M0AR;
+    g_s1_ndtr  = DMA1_Stream1->NDTR;
+    g_sr_snap  = SPI2->SR;
+    g_cr1_snap = SPI2->CR1;
 
     /* 8. 通知主循环打印(慢速的串口输出不放在中断里做) */
     if (len != 0U)
@@ -571,7 +609,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.7 取反回环: 下一帧回发本帧数据的按位取反) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.9 取反回环 + SPE-toggle清FIFO) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
@@ -629,7 +667,15 @@ int main(void)
                 }
                 g_hexline[j] = '\0';
 
-                printf("[SPI2 Slave] 本帧 %u 字节:\r\n%s\r\n\r\n", (unsigned)len, g_hexline);
+                printf("[SPI2 Slave] 本帧 %u 字节:\r\n%s\r\n", (unsigned)len, g_hexline);
+                printf("[装载#%u] TX=%02X %02X %02X %02X %02X %02X %02X %02X | S1 CR=%08lX PAR=%08lX M0AR=%08lX NDTR=%lu\r\n",
+                       (unsigned)g_tx_load_cnt,
+                       g_tx_snap[0], g_tx_snap[1], g_tx_snap[2], g_tx_snap[3],
+                       g_tx_snap[4], g_tx_snap[5], g_tx_snap[6], g_tx_snap[7],
+                       (unsigned long)g_s1_cr, (unsigned long)g_s1_par,
+                       (unsigned long)g_s1_m0ar, (unsigned long)g_s1_ndtr);
+                printf("          SPI SR=%08lX CR1=%08lX\r\n\r\n",
+                       (unsigned long)g_sr_snap, (unsigned long)g_cr1_snap);
             }
         }
 
