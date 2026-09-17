@@ -177,11 +177,14 @@ static void spi2_gpio_init(void)
 
     __HAL_RCC_GPIOB_CLK_ENABLE();               /* 使能GPIOB时钟                                */
 
-    /* SCK/MISO/MOSI: 复用推挽(AF5=SPI2) */
+    /* SCK/MISO/MOSI: 复用推挽(AF5=SPI2)
+     * V2.6: Speed VERY_HIGH -> LOW。Speed只决定输出驱动斜率(对输入脚无意义),
+     * 从机唯一的输出脚是MISO。100kHz完全不需要高速边沿; 缓边沿可显著减少
+     * MISO对SCK的串扰(实测: 仅当MISO翻转时双方向偏1位, MISO平线时全对)。 */
     gpio_init_struct.Pin       = SPI2_SCK_PIN | SPI2_MISO_PIN | SPI2_MOSI_PIN;
     gpio_init_struct.Mode      = GPIO_MODE_AF_PP;
     gpio_init_struct.Pull      = GPIO_NOPULL;
-    gpio_init_struct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio_init_struct.Speed     = GPIO_SPEED_FREQ_LOW;
     gpio_init_struct.Alternate = GPIO_AF5_SPI2;
     HAL_GPIO_Init(SPI2_GPIO_PORT, &gpio_init_struct);
 
@@ -550,7 +553,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.5 软件NSS+EXTI去抖) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.6 MISO边沿减速) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
