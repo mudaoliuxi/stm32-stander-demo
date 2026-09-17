@@ -100,7 +100,7 @@
 /* 片选管理: 0=硬件NSS(PB12走AF5)  1=软件NSS(SSI恒0)
    ★ 默认1: 软件NSS是V1.4实测跑通的路径("之前接收是正确的"), 别默认开硬件NSS --
      那是V1.5的试验项, 上板未验证, 默认开着只会让问题更难定位。 */
-#define SPI_NSS_MODE            1
+#define SPI_NSS_MODE            0
 
 /* Master读走的应答内容: 16个 0xA5
    [!] 若心跳里 UDR 每帧+1, 说明 Master 读的字节数 >= 从机 TX 准备的长度,
@@ -386,9 +386,12 @@ static void spi2_slave_start(void)
     SET_BIT(SPI2->CFG1, SPI_CFG1_RXDMAEN | SPI_CFG1_TXDMAEN);
     __HAL_SPI_ENABLE(&g_spi2_handle);
 
-    /* 4. 最后武装两路DMA, 静静等第一帧到来 */
+    /* 4. 最后武装两路DMA, 静静等第一帧到来
+    *    ★ 注意参数顺序: PAR=外设寄存器, M0AR=内存缓冲。
+    *      V2.2曾把TX这路的两个参数写反(PAR=buf,M0AR=TXDR), 结果DMA从TXDR读数
+    *      (恒0)写进FIFO -> MISO输出全0、UDR不置位, 极难察觉。 */
     dma_stream_reload(DMA1_Stream0, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
-    dma_stream_reload(DMA1_Stream1, (uint32_t)g_spi_tx_buf, (uint32_t)&SPI2->TXDR, SPI_TX_PATTERN_LEN);
+    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, SPI_TX_PATTERN_LEN);
 }
 
 /**
@@ -464,7 +467,7 @@ static void spi_frame_close(void)
 
     /* 7. 重装两路DMA: 下一帧从 缓冲[0] 重新开始收 */
     dma_stream_reload(DMA1_Stream0, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
-    dma_stream_reload(DMA1_Stream1, (uint32_t)g_spi_tx_buf, (uint32_t)&SPI2->TXDR, SPI_TX_PATTERN_LEN);
+    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, SPI_TX_PATTERN_LEN);
 
     /* 8. 通知主循环打印(慢速的串口输出不放在中断里做) */
     if (len != 0U)
@@ -535,7 +538,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.2 每帧独立+收完即清空) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.4 硬件NSS, 每帧重新对齐) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
