@@ -143,6 +143,7 @@ static uint8_t  g_print_buf[SPI_RX_BUF_SIZE];                            /* 打印
 static char     g_hexline[SPI_RX_BUF_SIZE * 3 + SPI_RX_BUF_SIZE / 8 + 16]; /* 十六进制行缓冲   */
 
 volatile uint8_t  g_spi_frame_ready = 0;        /* 1 = 有新帧待打印                             */
+volatile uint16_t g_spi_tx_reply_len = 16U;     /* V2.7: 下一帧回发长度(=上一帧长度, 上限32)    */
 volatile uint16_t g_spi_frame_len   = 0;        /* 新帧长度                                     */
 volatile uint32_t g_spi_irq_cnt     = 0;        /* NSS上升沿(EXTI)次数                          */
 volatile uint32_t g_spi_drop_cnt    = 0;        /* 空帧丢弃次数(多半是NSS线上的毛刺)            */
@@ -399,7 +400,7 @@ static void spi2_slave_start(void)
     *      V2.2曾把TX这路的两个参数写反(PAR=buf,M0AR=TXDR), 结果DMA从TXDR读数
     *      (恒0)写进FIFO -> MISO输出全0、UDR不置位, 极难察觉。 */
     dma_stream_reload(DMA1_Stream0, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
-    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, SPI_TX_PATTERN_LEN);
+    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, g_spi_tx_reply_len);
 }
 
 /**
@@ -411,6 +412,8 @@ static void spi2_slave_start(void)
 static void spi_frame_close(void)
 {
     uint16_t len;
+    uint16_t n;
+    uint16_t i;
     uint32_t guard;
 
     g_spi_irq_cnt++;
@@ -463,6 +466,21 @@ static void spi_frame_close(void)
     {
         SCB_InvalidateDCache_by_Addr((uint32_t *)g_spi_rx_buf, (int32_t)sizeof(g_spi_rx_buf));
         memcpy((void *)g_spi_frame_buf, (const void *)g_spi_rx_buf, len);
+
+        /* 5.5 V2.7 取反回环: 本帧数据逐位取反 -> 下一帧回发。
+         * 时序决定只能"下一帧"回发: TX 内容必须在 Master 打时钟前进 FIFO。
+         * 协议: Master 第N帧读到的是 第N-1帧所发数据的取反; 上电默认回发16个A5。 */
+        n = (len < 32U) ? len : 32U;        /* TX缓冲共32字节, 超长截断                  */
+        for (i = 0U; i < n; i++)
+        {
+            g_spi_tx_buf[i] = (uint8_t)~g_spi_frame_buf[i];
+        }
+        for (i = n; i < 32U; i++)
+        {
+            g_spi_tx_buf[i] = 0x00;
+        }
+        SCB_CleanDCache_by_Addr((uint32_t *)g_spi_tx_buf, 32);
+        g_spi_tx_reply_len = n;
     }
     else
     {
@@ -475,7 +493,7 @@ static void spi_frame_close(void)
 
     /* 7. 重装两路DMA: 下一帧从 缓冲[0] 重新开始收 */
     dma_stream_reload(DMA1_Stream0, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
-    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, SPI_TX_PATTERN_LEN);
+    dma_stream_reload(DMA1_Stream1, (uint32_t)&SPI2->TXDR, (uint32_t)g_spi_tx_buf, g_spi_tx_reply_len);
 
     /* 8. 通知主循环打印(慢速的串口输出不放在中断里做) */
     if (len != 0U)
@@ -553,7 +571,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.6 MISO边沿减速) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.7 取反回环: 下一帧回发本帧数据的按位取反) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
