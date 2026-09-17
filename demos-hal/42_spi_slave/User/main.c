@@ -97,8 +97,10 @@
    必须与Master(例如 /dev/spidev2.0 的 spi mode)一致, RK3576默认 Mode0 */
 #define SPI_DEMO_MODE           0
 
-/* 片选管理: 0=硬件NSS(PB12走AF5, 推荐) 1=软件NSS(SSI恒0, 旧行为) */
-#define SPI_NSS_MODE            0
+/* 片选管理: 0=硬件NSS(PB12走AF5)  1=软件NSS(SSI恒0)
+   ★ 默认1: 软件NSS是V1.4实测跑通的路径("之前接收是正确的"), 别默认开硬件NSS --
+     那是V1.5的试验项, 上板未验证, 默认开着只会让问题更难定位。 */
+#define SPI_NSS_MODE            1
 
 /* Master读走的应答内容: 16个 0xA5 */
 #define SPI_TX_REPLY_BYTE       0xA5
@@ -318,11 +320,17 @@ static void spi2_init(void)
  */
 static void dma_stream_reload(DMA_Stream_TypeDef *s, uint32_t par, uint32_t m0ar, uint16_t ndtr)
 {
+    uint32_t guard;
+
     CLEAR_BIT(s->CR, DMA_SxCR_EN);                      /* 1. 停流                      */
 
-    while ((s->CR & DMA_SxCR_EN) != 0UL)                /* 2. 等硬件真的清0(必须!)      */
+    /* 2. 等硬件真的清0 —— ★ 必须带超时。万一流被外设请求异常挂住、EN位清不掉,
+     *    原来的空转死等会让程序在这里永久卡死(串口从此静默)。
+     *    超时后强行继续: 最坏这一帧数据不干净, 但板子还活着, 还能给你报错。   */
+    guard = 200000UL;
+    while (((s->CR & DMA_SxCR_EN) != 0UL) && (guard != 0UL))
     {
-        /* 空转等待 */
+        guard--;
     }
 
     s->PAR  = par;                                      /* 3. EN=0时才允许改地址/计数   */
@@ -402,8 +410,10 @@ static void spi_frame_close(void)
     /* 2. 停掉两路DMA流 (只清EN位, 绝不碰SPI的SPE) */
     CLEAR_BIT(DMA1_Stream0->CR, DMA_SxCR_EN);
     CLEAR_BIT(DMA1_Stream1->CR, DMA_SxCR_EN);
-    while ((DMA1_Stream0->CR & DMA_SxCR_EN) != 0UL) { }
-    while ((DMA1_Stream1->CR & DMA_SxCR_EN) != 0UL) { }
+    guard = 200000UL;                                   /* ★ 必须带超时: 这里在最高 */
+    while (((DMA1_Stream0->CR & DMA_SxCR_EN) != 0UL) && (guard != 0UL)) { guard--; }
+    guard = 200000UL;                                   /*   优先级中断里, 裸死等   */
+    while (((DMA1_Stream1->CR & DMA_SxCR_EN) != 0UL) && (guard != 0UL)) { guard--; }
 
     /* 3. 算本帧长度: NORMAL模式下NDTR从 SIZE 一路递减, 收到几个字节就减几 */
     len = (uint16_t)(SPI_RX_BUF_SIZE - (uint16_t)DMA1_Stream0->NDTR);
@@ -495,9 +505,7 @@ int main(void)
     uint16_t len;
     uint32_t tick_led  = 0;
     uint32_t tick_diag = 0;
-    uint32_t diag_irq  = 0;
-    uint32_t diag_drop = 0;
-    uint32_t diag_err  = 0;
+    uint32_t diag_ok   = 0;
     uint8_t  led_state = 0;
 
     sys_cache_enable();                  /* 打开L1-Cache(D-Cache强制透写) */
@@ -507,7 +515,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.0 每帧独立+收完即清空) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.1 每帧独立+收完即清空) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
@@ -549,6 +557,7 @@ int main(void)
 
             if (len != 0U)
             {
+                diag_ok++;
                 j = 0;
                 for (i = 0; i < len; i++)
                 {
@@ -576,22 +585,19 @@ int main(void)
             LED0(led_state);
         }
 
-        /* 每3秒输出一次诊断计数(只在有变化时打印, 避免刷屏) */
-        if ((HAL_GetTick() - tick_diag) >= 3000)
+        /* ★ 心跳: 每2秒无条件打一行 —— 排查"串口没反应"的第一判据。
+         *   有这行 => 程序在跑、串口通, 问题只在SPI数据通路上;
+         *   没这行 => 板子根本没跑起来(烧录/复位/串口线), 跟SPI逻辑无关。
+         *   别删。                                                            */
+        if ((HAL_GetTick() - tick_diag) >= 2000)
         {
             tick_diag = HAL_GetTick();
 
-            if ((g_spi_irq_cnt != diag_irq) || (g_spi_drop_cnt != diag_drop) ||
-                (g_spi_err_cnt != diag_err))
-            {
-                diag_irq  = g_spi_irq_cnt;
-                diag_drop = g_spi_drop_cnt;
-                diag_err  = g_spi_err_cnt;
-
-                printf("[诊断] NSS边沿=%lu  空帧=%lu  SPI错误=%lu\r\n",
-                       (unsigned long)diag_irq, (unsigned long)diag_drop,
-                       (unsigned long)diag_err);
-            }
+            printf("[心跳] %lu s | NSS边沿=%lu 有效帧=%lu 空帧=%lu SPI错误=%lu | SPI_EN=%d\r\n",
+                   (unsigned long)(HAL_GetTick() / 1000UL), (unsigned long)g_spi_irq_cnt,
+                   (unsigned long)diag_ok, (unsigned long)g_spi_drop_cnt,
+                   (unsigned long)g_spi_err_cnt,
+                   ((SPI2->CR1 & SPI_CR1_SPE) != 0UL) ? 1 : 0);
         }
     }
 }
