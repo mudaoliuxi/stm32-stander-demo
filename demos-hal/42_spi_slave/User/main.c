@@ -114,6 +114,16 @@
    依次换成 1/2/3 重新编译测试, 同时把Master改成同样模式                  */
 #define SPI_DEMO_MODE           0
 
+/* 从机片选(NSS)管理方式 —— V1.5 新增
+ *  0 = 硬件NSS (V1.5 默认, 推荐)
+ *      PB12 走 AF5 交给 SPI2 硬件做真片选: NSS 无效(高)期间 SPI 直接忽略 SCK。
+ *      V1.4 及以前用软件 NSS(SSI 恒 0)把从机"永久选中", 于是 Master 在帧间
+ *      切换 CS 时 SCK 上的任何扰动都会被当成一个数据位, 整帧因此偏 1 位
+ *      且永不恢复 —— 实测: 发 A5 收 D2(A5 循环右移 1 位),
+ *      MISO 上则是 70 72 74 76 78 7A 7C 7E(= 38~3F 各左移 1 位)。
+ *  1 = 软件 NSS (旧行为, 保留以便对比/回退)                            */
+#define SPI_NSS_MODE            0
+
 /* Master会重复发送的"已知字节", 从机用它自动反推位偏移(诊断用)             */
 #define SPI_PROBE_BYTE          0xA5
 
@@ -201,7 +211,10 @@ static void spi2_gpio_init(void)
     gpio_init_struct.Alternate = GPIO_AF5_SPI2;
     HAL_GPIO_Init(SPI2_GPIO_PORT, &gpio_init_struct);
 
-    /* NSS(PB12): SPI用软件NSS(SSI=0, 从机常选中), 该脚只作普通输入+EXTI上升沿, 用于切帧 */
+    /* NSS(PB12) 要同时干两件事:
+     *   (a) 给SPI硬件当片选输入(AF5) —— NSS无效期间SPI直接忽略SCK (SPI_NSS_MODE==0)
+     *   (b) 帧边界检测 —— 上升沿走EXTI中断切帧
+     * 先按EXTI输入配好, 稍后再把MODER叠成AF5 (见下方 #if SPI_NSS_MODE==0)。    */
     /* 上拉: 总线空闲时保持高电平(未选中)                                                */
     gpio_init_struct.Pin       = SPI2_NSS_PIN;
     gpio_init_struct.Mode      = GPIO_MODE_IT_RISING;
@@ -209,6 +222,14 @@ static void spi2_gpio_init(void)
     gpio_init_struct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio_init_struct.Alternate = 0;
     HAL_GPIO_Init(SPI2_GPIO_PORT, &gpio_init_struct);
+
+#if (SPI_NSS_MODE == 0)
+    /* 同一个 PB12 再叠一层 AF5: 交给 SPI2 硬件当 NSS 输入 (MODER=10, AFR=5)。
+     * EXTI 的边沿检测取自引脚输入缓冲, 与 MODER 无关, 所以"硬件片选"与
+     * "上升沿切帧"可以并存。PULLUP 保留: 总线空闲时 NSS 保持高(未选中)。   */
+    MODIFY_REG(GPIOB->MODER, GPIO_MODER_MODE12, GPIO_MODER_MODE12_1);
+    MODIFY_REG(GPIOB->AFR[1], (0xFUL << 16U), ((uint32_t)GPIO_AF5_SPI2 << 16U));
+#endif
 
     HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);             /* 最高抢占优先级               */
     HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
@@ -268,7 +289,7 @@ static void spi2_dma_init(void)
 }
 
 /**
- * @brief   SPI2初始化(从机模式, 软件NSS, 模式由SPI_DEMO_MODE决定)
+ * @brief   SPI2初始化(从机模式, NSS方式由SPI_NSS_MODE决定, SPI模式由SPI_DEMO_MODE决定)
  * @param   无
  * @retval  无
  */
@@ -295,7 +316,11 @@ static void spi2_init(void)
     g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_2EDGE;
 #endif
 
-    g_spi2_handle.Init.NSS                        = SPI_NSS_SOFT;            /* 软件NSS          */
+#if (SPI_NSS_MODE == 0)
+    g_spi2_handle.Init.NSS                        = SPI_NSS_HARD_INPUT;      /* 硬件NSS(真片选)  */
+#else
+    g_spi2_handle.Init.NSS                        = SPI_NSS_SOFT;            /* 软件NSS(旧行为)  */
+#endif
     g_spi2_handle.Init.FirstBit                   = SPI_FIRSTBIT_MSB;        /* MSB先发          */
     g_spi2_handle.Init.TIMode                     = SPI_TIMODE_DISABLE;      /* TI模式关闭       */
     g_spi2_handle.Init.CRCCalculation             = SPI_CRCCALCULATION_DISABLE;
@@ -309,7 +334,9 @@ static void spi2_init(void)
 
     /* HAL只在 (从机 && NSSPolarity==HIGH) 时才置SSI; 这里显式清0 => 从机常选中 */
     /* (MISO常驱动输出, 只适用于单从机总线)                                      */
+#if (SPI_NSS_MODE != 0)
     CLEAR_BIT(g_spi2_handle.Instance->CR1, SPI_CR1_SSI);
+#endif
 
     /* 关闭SPI自身的错误中断(本工程不用HAL的SPI状态机, 出错靠轮询SR诊断) */
     WRITE_REG(g_spi2_handle.Instance->IER, 0);
@@ -436,7 +463,11 @@ static void spi_dump_regs(void)
            (unsigned long)DMA1_Stream1->PAR, (unsigned long)DMA1_Stream1->M0AR,
            (unsigned)SPI_TX_PATTERN_LEN);
     printf(" 说明: CR的bit10(MINC)与bit8(CIRC)应都为1; NDTR应等于缓冲大小\r\n");
+#if (SPI_NSS_MODE == 0)
+    printf("       CFG2的CPOL(bit0)/CPHA(bit1)应对应当前SPI模式; 硬件NSS下SSM(bit8)=0, SSI(bit12)应为1\r\n");
+#else
     printf("       CFG2的CPOL(bit0)/CPHA(bit1)应对应当前SPI模式; CR1的SSI(bit12)应为0\r\n");
+#endif
     printf("       TX的M0AR应指向g_spi_tx_buf, PAR应指向SPI2->TXDR(0x4000380C)\r\n\r\n");
 }
 
@@ -600,6 +631,8 @@ int main(void)
     printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V1.4 环形DMA常驻+位对齐自诊断) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d  (0=Mode0 1=Mode1 2=Mode2 3=Mode3)\r\n", (int)SPI_DEMO_MODE);
+    printf("从机NSS模式: %s\r\n", (SPI_NSS_MODE == 0) ?
+           "硬件NSS(PB12=AF5, 帧间忽略SCK)" : "软件NSS(SSI恒0, 旧行为)");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("支持Master SCK: 100kHz ~ 10MHz (MSB先发, 8bit)\r\n");
     printf("Master写: 收到数据后打印在串口1\r\n");
