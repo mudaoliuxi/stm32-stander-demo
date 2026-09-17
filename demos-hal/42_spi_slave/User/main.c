@@ -2,9 +2,9 @@
  ****************************************************************************************************
  * @file        main.c
  * @author      正点原子团队(ALIENTEK)
- * @version     V1.3
- * @date        2026-09-16
- * @brief       SPI2从机(Slave)通信实验 (环形DMA常驻版)
+ * @version     V1.4
+ * @date        2026-09-17
+ * @brief       SPI2从机(Slave)通信实验 (环形DMA常驻 + 位对齐自诊断)
  * @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
  ****************************************************************************************************
  * @attention
@@ -19,18 +19,17 @@
  *  1. SPI2从机, 引脚: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15 (AF5)
  *     (M100Z-M7板上SPI2是唯一引出到排针的通用SPI, QSPI已接NOR FLASH不能占用)
  *
- *  2. 支持Master的SCK时钟: 5 / 10 / 15 / 20 MHz
+ *  2. 支持Master的SCK时钟: 100kHz ~ 10MHz
  *     (SPI2内核时钟 = PCLK1 = 120MHz, 从机模式最高可跟约 60MHz 的SCK)
- *     Master端需配置为: SPI Mode0 (CPOL=0, CPHA=0), MSB先发, 8bit
  *
  *  3. Master写: NSS拉低期间发送的数据, 从机在NSS上升沿(一帧结束)后
  *     通过串口1(115200)以十六进制打印出来
  *
- *  4. Master读: 从机MISO恒定返回16字节应答数据(0x30~0x3F循环),
- *     Master每次读16字节都能拿到完整的 30 31 32 ... 3F
+ *  4. Master读: 从机MISO恒定循环返回16字节应答数据
+ *     V1.4默认应答 = 16个 0xA5 (位对齐探针, 见下方说明)
  *
  * -------------------------------------------------------------------------------------------------
- * 【V1.3 架构说明: 为什么改成"环形DMA常驻"】
+ * 【V1.3 架构说明: 为什么用"环形DMA常驻"】
  *
  *  V1.0~V1.2 用的是"每帧NSS上升沿 -> 停SPI/DMA -> 处理 -> 重新武装"的模型,
  *  实测在STM32H7上会踩三个大坑:
@@ -49,15 +48,38 @@
  *
  *    - RX: 512字节环形缓冲, 永不停止。NSS上升沿时读DMA剩余计数NDTR,
  *          本帧长度 = (上次NDTR - 本次NDTR) & (512-1), 再从环形缓冲对应位置取出数据。
- *    - TX: 16字节环形缓冲(应答pattern)。缓冲长度正好等于pattern长度,
- *          因此FIFO里预装的永远是 30 31 ... 3F 的连续片段, Master读到的必然正确。
+ *    - TX: 16字节环形缓冲(应答pattern)。
  *    - 完全不用HAL的SPI状态机, DMA也不开中断, 全片唯一中断源就是NSS的EXTI。
  *
  *  好处: 从机在任何时刻都是"武装好"的状态, 不存在重新武装窗口, 也不存在FIFO残留。
  * -------------------------------------------------------------------------------------------------
+ * 【V1.4 说明: 为什么把应答pattern换成 0xA5, 以及位对齐怎么自诊断】
+ *
+ *  现象: V1.3 用 0x30~0x3F 做应答pattern时, 实测"看起来数据不对", 但排查很久
+ *        都说不清到底错在哪。根因之一在于 0x30~0x3F 是一条"递增斜坡":
+ *        - 任何一个位的偏移, 移完仍然是一条递增斜坡, 肉眼根本区分不出来;
+ *        - 逻辑分析仪上看起来也还是"干净漂亮的递增", 极容易被误判为正常;
+ *        换句话说, 斜坡数据在诊断上是"最坏的选择"。用逻辑分析仪抓到的
+ *        0x70 0x72 0x74 ... 就是斜坡被整体挪动1bit之后的结果。
+ *
+ *  0xA5 探针的好处: 0xA5 = 1010_0101, 它的8种循环移位互不相同:
+ *        A5 / 4B / 96 / 2D / 5A / B4 / 69 / D2
+ *        于是:
+ *          - 位对齐正确 => Master读到的应该是  A5 A5 A5 A5 ...
+ *          - 整体偏1位   => Master读到的会变成  4B 4B 4B 4B ... (或 52 52 ...)
+ *          - 偏2位 => 96, 偏3位 => 2D ... 一一对应, 一眼定位"偏了几位"
+ *        而且pattern只有1字节周期, 环形缓冲的"相位"是多少都不影响正确性。
+ *
+ *  更省事的是从机侧会自动判读: Master只要重复发同一个字节(推荐发 0xA5),
+ *  从机收到整帧字节相同时, 会自动算出它相对 0xA5 的循环移位量并打印结论,
+ *  直接告诉你是"位对齐正确"还是"偏了N位"。
+ *
+ *  如果实测确认是位偏移, 把下面的 SPI_DEMO_MODE 依次改成 1/2/3 重新编译烧录,
+ *  总有一个能对上(0=Mode0, 1=Mode1, 2=Mode2, 3=Mode3)。Master端必须同步改成同样模式。
+ * -------------------------------------------------------------------------------------------------
  *
  * 注意事项:
- *  - 单帧最大长度 <= 512 字节(SPI_RX_BUF_SIZE), 超过会回绕丢数据
+ *  - 单帧最大长度 <= 256 字节(SPI_FRAME_MAX_LEN), 超过视为NSS漏沿被丢弃
  *  - 若业务上确实需要传输"全0xFF"的数据帧, 请删除毛刺过滤那一段
  *  - Master两次帧传输之间建议NSS保持高电平 >= 50us
  *
@@ -77,14 +99,39 @@
 /******************************************************************************************/
 
 #define SPI_RX_BUF_SIZE         512             /* RX环形缓冲大小, 必须是2的幂(用于取模)        */
-#define SPI_TX_PATTERN_LEN      16              /* 应答pattern长度(0x30~0x3F)                   */
+#define SPI_TX_PATTERN_LEN      16              /* 应答pattern长度                              */
+#define SPI_FRAME_MAX_LEN       256             /* 单帧长度上限(超过视为NSS漏沿, 丢弃)          */
 
-/* Master读操作时, 从机返回的16字节应答数据 */
+/* ==================== V1.4 可配置项 ==================== */
+
+/* 应答pattern选择:
+     0 = 0xA5 位对齐探针(强烈推荐) —— 任何位偏移都会变成另一个固定值, 一眼可判
+     1 = 0x30~0x3F 递增斜坡       —— V1.3的旧行为, 仅用于兼容老测试脚本         */
+#define SPI_TX_PATTERN_MODE     0
+
+/* 从机SPI模式: 0=Mode0(CPOL0/CPHA0) 1=Mode1 2=Mode2 3=Mode3
+   默认0(与Master的 spi mode 0x0 对应); 若实测发现主从数据整体错位,
+   依次换成 1/2/3 重新编译测试, 同时把Master改成同样模式                  */
+#define SPI_DEMO_MODE           0
+
+/* Master会重复发送的"已知字节", 从机用它自动反推位偏移(诊断用)             */
+#define SPI_PROBE_BYTE          0xA5
+
+#if (SPI_TX_PATTERN_MODE == 0)
+/* 方案0: 16个 0xA5 —— 位对齐探针 */
+static const uint8_t g_spi_reply_pattern[SPI_TX_PATTERN_LEN] =
+{
+    0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5,
+    0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5
+};
+#else
+/* 方案1: 16字节递增 0x30~0x3F (V1.3旧行为) */
 static const uint8_t g_spi_reply_pattern[SPI_TX_PATTERN_LEN] =
 {
     0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
     0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F
 };
+#endif
 
 /* 32字节对齐宏(兼容AC5/AC6) */
 #if defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6010050)
@@ -101,12 +148,13 @@ SPI_HandleTypeDef g_spi2_handle;                /* SPI2句柄                     
 DMA_HandleTypeDef g_spi2_rx_dma;                /* SPI2 RX DMA句柄 (DMA1_Stream0)               */
 DMA_HandleTypeDef g_spi2_tx_dma;                /* SPI2 TX DMA句柄 (DMA1_Stream1)               */
 
-/* 收发DMA缓冲区: 32字节对齐, 位于AXI SRAM(0x24000000), DMA1可访问且可缓存 */
-/* DCache为透写模式: CPU写直达RAM; RX方向DMA写内存后CPU读取前必须Invalidate */
+/* 收发DMA缓冲区: 32字节对齐, 位于AXI SRAM(0x24000000, 见User/SCRIPT/qspi_code.scf.scf
+   的 RW_m_stmsram 段), DMA1可访问; 该区域可Cache, 由 sys_cache_enable() 打开D-Cache */
 ALIGNED32 static uint8_t g_spi_rx_buf[SPI_RX_BUF_SIZE];
 ALIGNED32 static uint8_t g_spi_tx_buf[32];      /* 实际只用前16字节, 留满1个Cache行便于整行操作 */
 
 static uint8_t  g_spi_frame_buf[SPI_RX_BUF_SIZE];                       /* 帧影子缓冲(中断中拷贝) */
+static uint8_t  g_print_buf[SPI_RX_BUF_SIZE];                           /* 打印用副本(与中断隔离) */
 static char     g_hexline[SPI_RX_BUF_SIZE * 3 + SPI_RX_BUF_SIZE / 8 + 16]; /* 十六进制行缓冲     */
 
 volatile uint16_t g_spi_rx_prev_ndtr = SPI_RX_BUF_SIZE; /* 上次NSS上升沿时的DMA剩余计数         */
@@ -117,6 +165,7 @@ volatile uint32_t g_spi_irq_cnt      = 0;               /* NSS上升沿(EXTI)触发次
 volatile uint32_t g_spi_glitch_cnt   = 0;               /* 全0xFF毛刺帧丢弃数                   */
 volatile uint32_t g_spi_err_cnt      = 0;               /* SPI OVR/UDR/FRE/MODF 错误次数        */
 volatile uint32_t g_spi_fifo_stuck   = 0;               /* RX FIFO排空超时次数(正常恒为0)       */
+volatile uint32_t g_spi_toolong_cnt  = 0;               /* 超过SPI_FRAME_MAX_LEN被丢弃的帧数    */
 
 static const char g_hex_tab[16] = "0123456789ABCDEF";
 
@@ -131,6 +180,7 @@ static void spi2_slave_start(void);
 static uint8_t spi_probe_pin(uint16_t pin);
 static void spi_line_report(void);
 static void spi_dump_regs(void);
+static int8_t spi_rot_of(uint8_t v, uint8_t ref);
 
 /**
  * @brief   SPI2引脚初始化
@@ -218,7 +268,7 @@ static void spi2_dma_init(void)
 }
 
 /**
- * @brief   SPI2初始化(从机模式, 软件NSS)
+ * @brief   SPI2初始化(从机模式, 软件NSS, 模式由SPI_DEMO_MODE决定)
  * @param   无
  * @retval  无
  */
@@ -230,8 +280,21 @@ static void spi2_init(void)
     g_spi2_handle.Init.Mode                       = SPI_MODE_SLAVE;          /* 从机模式         */
     g_spi2_handle.Init.Direction                  = SPI_DIRECTION_2LINES;    /* 全双工           */
     g_spi2_handle.Init.DataSize                   = SPI_DATASIZE_8BIT;       /* 8bit帧格式       */
-    g_spi2_handle.Init.CLKPolarity                = SPI_POLARITY_LOW;        /* CPOL=0           */
-    g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_1EDGE;         /* CPHA=0 => Mode0  */
+
+#if   (SPI_DEMO_MODE == 0)                      /* Mode0: CPOL=0, CPHA=0(空闲低, 第1边沿采样) */
+    g_spi2_handle.Init.CLKPolarity                = SPI_POLARITY_LOW;
+    g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_1EDGE;
+#elif (SPI_DEMO_MODE == 1)                      /* Mode1: CPOL=0, CPHA=1                    */
+    g_spi2_handle.Init.CLKPolarity                = SPI_POLARITY_LOW;
+    g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_2EDGE;
+#elif (SPI_DEMO_MODE == 2)                      /* Mode2: CPOL=1, CPHA=0                    */
+    g_spi2_handle.Init.CLKPolarity                = SPI_POLARITY_HIGH;
+    g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_1EDGE;
+#else                                           /* Mode3: CPOL=1, CPHA=1                    */
+    g_spi2_handle.Init.CLKPolarity                = SPI_POLARITY_HIGH;
+    g_spi2_handle.Init.CLKPhase                   = SPI_PHASE_2EDGE;
+#endif
+
     g_spi2_handle.Init.NSS                        = SPI_NSS_SOFT;            /* 软件NSS          */
     g_spi2_handle.Init.FirstBit                   = SPI_FIRSTBIT_MSB;        /* MSB先发          */
     g_spi2_handle.Init.TIMode                     = SPI_TIMODE_DISABLE;      /* TI模式关闭       */
@@ -261,13 +324,19 @@ static void spi2_slave_start(void)
 {
     uint16_t i;
 
-    /* 1. TX应答缓冲填充: 16字节pattern。DMA是环形, 长度=16=pattern长度,  */
-    /*    所以FIFO里预装的永远是 30 31 ... 3F 的连续片段                    */
+    /* 1. TX应答缓冲填充: 16字节pattern。DMA是环形, 长度=16=pattern长度 */
     for (i = 0; i < SPI_TX_PATTERN_LEN; i++)
     {
         g_spi_tx_buf[i] = g_spi_reply_pattern[i];
     }
+
+    /* 1b. RX/影子缓冲清零并回写, 避免上电残留内容被误当成"收到的数据"(上电首次很关键) */
+    memset((void *)g_spi_rx_buf,    0, sizeof(g_spi_rx_buf));
+    memset((void *)g_spi_frame_buf, 0, sizeof(g_spi_frame_buf));
+    memset((void *)g_print_buf,     0, sizeof(g_print_buf));
+
     SCB_CleanDCache_by_Addr((uint32_t *)g_spi_tx_buf, 32);
+    SCB_CleanDCache_by_Addr((uint32_t *)g_spi_rx_buf, (int32_t)sizeof(g_spi_rx_buf));
 
     /* 2. 直接启动两路DMA(HAL_DMA_Start_IT只配DMA, 不碰SPI, 不会改SPI状态机) */
     HAL_DMA_Start_IT(&g_spi2_rx_dma, (uint32_t)&SPI2->RXDR, (uint32_t)g_spi_rx_buf, SPI_RX_BUF_SIZE);
@@ -366,7 +435,31 @@ static void spi_dump_regs(void)
            (unsigned long)DMA1_Stream1->CR, (unsigned long)DMA1_Stream1->NDTR,
            (unsigned long)DMA1_Stream1->PAR, (unsigned long)DMA1_Stream1->M0AR,
            (unsigned)SPI_TX_PATTERN_LEN);
-    printf(" 说明: CR的bit10(MINC)与bit8(CIRC)应都为1; NDTR应等于缓冲大小\r\n\r\n");
+    printf(" 说明: CR的bit10(MINC)与bit8(CIRC)应都为1; NDTR应等于缓冲大小\r\n");
+    printf("       CFG2的CPOL(bit0)/CPHA(bit1)应对应当前SPI模式; CR1的SSI(bit12)应为0\r\n");
+    printf("       TX的M0AR应指向g_spi_tx_buf, PAR应指向SPI2->TXDR(0x4000380C)\r\n\r\n");
+}
+
+/**
+ * @brief   求 v 是 ref 的"循环左移多少位"的结果
+ * @param   v   : 收到的字节
+ * @param   ref : 参考字节(探针)
+ * @retval  -1=不是ref的任何循环移位; 0=完全相同; 1~7=循环左移的位数
+ */
+static int8_t spi_rot_of(uint8_t v, uint8_t ref)
+{
+    uint8_t i;
+    uint8_t r = ref;
+
+    for (i = 0; i < 8U; i++)
+    {
+        if (r == v)
+        {
+            return (int8_t)i;
+        }
+        r = (uint8_t)((r << 1) | (r >> 7));     /* 循环左移1位 */
+    }
+    return -1;
 }
 
 /**
@@ -393,16 +486,24 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
     g_spi_irq_cnt++;
 
-    /* 1. 等SPI的RX FIFO排空, 说明DMA已经把最后1个字节写进RAM了 */
-    /*    (NSS上升沿到最后一个SCK下降沿之间只有很短时间, 先等DMA搬完) */
+    /* 1. 等SPI的RX FIFO彻底排空, 说明DMA已经把最后1个字节写进RAM了 */
+    /*    只等 RXWNE(RX FIFO Word Not Empty) 是不够的: 它表示"有凑满的32bit字",
+     *    DSIZE=8时最后1~3个字节可能凑不满一个字, 此时RXWNE已经是0但数据还在FIFO里。
+     *    这里把 RXP(FIFO非空) / RXWNE / RXPLVL(打包余量) 一起判, 保证真的空了 */
     guard = 20000UL;
-    while (((SPI2->SR & SPI_SR_RXWNE) != 0UL) && (guard != 0UL))
+    while (((SPI2->SR & (SPI_SR_RXP | SPI_SR_RXWNE | SPI_SR_RXPLVL)) != 0UL) && (guard != 0UL))
     {
         guard--;
     }
     if (guard == 0UL)
     {
         g_spi_fifo_stuck++;                     /* 极端情况: FIFO一直不空, 计数便于定位 */
+    }
+
+    /* FIFO空了之后, DMA还要几个周期才把最后1个字节落到RAM, 稍等一下再取计数 */
+    for (guard = 0UL; guard < 200UL; guard++)
+    {
+        __NOP();
     }
 
     /* 2. 读DMA剩余计数, 算出本帧在环形缓冲里的起始偏移和长度 */
@@ -426,6 +527,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if ((len == 0U) || (len >= SPI_RX_BUF_SIZE))
     {
         return;                                 /* 空帧(毛刺造成的重复上升沿), 直接忽略 */
+    }
+    if (len > SPI_FRAME_MAX_LEN)
+    {
+        g_spi_toolong_cnt++;                    /* 超长帧(多半是NSS漏沿), 丢弃不打印    */
+        return;
     }
 
     /* 4. DMA写的是AXI SRAM, CPU读前必须失效Cache */
@@ -481,6 +587,7 @@ int main(void)
     uint32_t diag_glit = 0;
     uint32_t diag_err  = 0;
     uint32_t diag_stuck = 0;
+    uint32_t diag_toolong = 0;
     uint8_t  led_state = 0;
 
     sys_cache_enable();                  /* 打开L1-Cache(D-Cache强制透写) */
@@ -490,12 +597,21 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V1.3 环形DMA常驻版) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V1.4 环形DMA常驻+位对齐自诊断) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
-    printf("支持Master SCK: 5 / 10 / 15 / 20 MHz (Mode0, MSB先发, 8bit)\r\n");
+    printf("从机SPI模式: SPI_DEMO_MODE=%d  (0=Mode0 1=Mode1 2=Mode2 3=Mode3)\r\n", (int)SPI_DEMO_MODE);
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
+    printf("支持Master SCK: 100kHz ~ 10MHz (MSB先发, 8bit)\r\n");
     printf("Master写: 收到数据后打印在串口1\r\n");
+
+#if (SPI_TX_PATTERN_MODE == 0)
+    printf("Master读: 每帧循环返回16字节(全 0xA5, 位对齐探针)\r\n");
+    printf("建议测试1(验从机RX): spidev_test 发 8 个 0xA5\r\n");
+    printf("                     从机会自动判读并打印\"位对齐正确\"或\"偏了N位\"\r\n");
+    printf("建议测试2(验从机TX): 读回8字节, 应该正好是 A5 A5 A5 A5 A5 A5 A5 A5\r\n\r\n");
+#else
     printf("Master读: 每帧返回16字节(30 31 32 ... 3F)\r\n\r\n");
+#endif
 
     spi_line_report();                   /* 上电先报告各线电平, 便于排查接线 */
 
@@ -513,25 +629,84 @@ int main(void)
         /* 有新帧? 打印本帧收到的数据 */
         if (g_spi_frame_ready)
         {
-            len = g_spi_frame_len;          /* 先取走长度和标志, 防止与新帧竞争 */
+            /* 关中断把整帧取走: 中断里会往 g_spi_frame_buf 里memcpy下一帧,
+               不隔离的话主循环可能读到"半新半旧"的混合数据 */
+            __disable_irq();
+            len = g_spi_frame_len;
             g_spi_frame_ready = 0;
-
-            j = 0;
-            for (i = 0; i < len; i++)
+            if (len > SPI_FRAME_MAX_LEN)
             {
-                g_hexline[j++] = g_hex_tab[(g_spi_frame_buf[i] >> 4) & 0x0F];
-                g_hexline[j++] = g_hex_tab[g_spi_frame_buf[i] & 0x0F];
-                g_hexline[j++] = ' ';
+                len = 0;
+            }
+            if (len != 0U)
+            {
+                memcpy((void *)g_print_buf, (const void *)g_spi_frame_buf, len);
+            }
+            __enable_irq();
 
-                if ((i & 0x0F) == 0x0F)     /* 每16字节换行 */
+            if (len != 0U)
+            {
+                j = 0;
+                for (i = 0; i < len; i++)
                 {
-                    g_hexline[j++] = '\r';
-                    g_hexline[j++] = '\n';
+                    g_hexline[j++] = g_hex_tab[(g_print_buf[i] >> 4) & 0x0F];
+                    g_hexline[j++] = g_hex_tab[g_print_buf[i] & 0x0F];
+                    g_hexline[j++] = ' ';
+
+                    if ((i & 0x0F) == 0x0F)     /* 每16字节换行 */
+                    {
+                        g_hexline[j++] = '\r';
+                        g_hexline[j++] = '\n';
+                    }
+                }
+                g_hexline[j] = '\0';
+
+                printf("[SPI2 Slave] 收到 %u 字节:\r\n%s\r\n", (unsigned)len, g_hexline);
+
+                /* ---- 位对齐自诊断: 整帧字节完全相同时, 反推相对探针的循环移位量 ---- */
+                {
+                    uint8_t same = 1;
+                    int8_t  rot;
+
+                    for (i = 1; i < len; i++)
+                    {
+                        if (g_print_buf[i] != g_print_buf[0])
+                        {
+                            same = 0;
+                            break;
+                        }
+                    }
+
+                    if (same != 0)
+                    {
+                        rot = spi_rot_of(g_print_buf[0], SPI_PROBE_BYTE);
+
+                        if (rot == 0)
+                        {
+                            printf("[对齐] 收到 %u 个 0x%02X = 探针 0x%02X => 从机采样位对齐正确\r\n\r\n",
+                                   (unsigned)len, (unsigned)g_print_buf[0], (unsigned)SPI_PROBE_BYTE);
+                        }
+                        else if (rot > 0)
+                        {
+                            printf("[对齐] 收到 %u 个 0x%02X = 0x%02X 循环左移 %d 位 => 位对齐偏了 %d 位\r\n",
+                                   (unsigned)len, (unsigned)g_print_buf[0], (unsigned)SPI_PROBE_BYTE,
+                                   (int)rot, (int)rot);
+                            printf("       把 SPI_DEMO_MODE 换一个值(依次试 1/2/3)重新编译烧录,\r\n");
+                            printf("       Master端同步改成同一模式再测一遍\r\n\r\n");
+                        }
+                        else
+                        {
+                            printf("[对齐] 收到 0x%02X 不是 0x%02X 的任何循环移位 => 不是单纯位偏移\r\n",
+                                   (unsigned)g_print_buf[0], (unsigned)SPI_PROBE_BYTE);
+                            printf("       重点查: 共地、SCK频率是否过高、SCK线上有无过冲振铃\r\n\r\n");
+                        }
+                    }
+                    else
+                    {
+                        printf("[对齐] 本帧字节不全相同, 跳过位偏移判读(Master发同一个字节时才有效)\r\n\r\n");
+                    }
                 }
             }
-            g_hexline[j] = '\0';
-
-            printf("[SPI2 Slave] 收到 %u 字节:\r\n%s\r\n", (unsigned)len, g_hexline);
         }
 
         /* LED0心跳翻转, 500ms一次, 指示程序在运行 */
@@ -548,16 +723,19 @@ int main(void)
             tick_diag = HAL_GetTick();
 
             if ((g_spi_irq_cnt != diag_irq) || (g_spi_glitch_cnt != diag_glit) ||
-                (g_spi_err_cnt != diag_err) || (g_spi_fifo_stuck != diag_stuck))
+                (g_spi_err_cnt != diag_err) || (g_spi_fifo_stuck != diag_stuck) ||
+                (g_spi_toolong_cnt != diag_toolong))
             {
-                diag_irq   = g_spi_irq_cnt;
-                diag_glit  = g_spi_glitch_cnt;
-                diag_err   = g_spi_err_cnt;
-                diag_stuck = g_spi_fifo_stuck;
+                diag_irq     = g_spi_irq_cnt;
+                diag_glit    = g_spi_glitch_cnt;
+                diag_err     = g_spi_err_cnt;
+                diag_stuck   = g_spi_fifo_stuck;
+                diag_toolong = g_spi_toolong_cnt;
 
-                printf("[诊断] NSS边沿=%lu  毛刺帧丢弃=%lu  SPI错误=%lu  FIFO排空超时=%lu\r\n",
+                printf("[诊断] NSS边沿=%lu  毛刺帧=%lu  超长帧=%lu  SPI错误=%lu  FIFO排空超时=%lu\r\n",
                        (unsigned long)diag_irq, (unsigned long)diag_glit,
-                       (unsigned long)diag_err, (unsigned long)diag_stuck);
+                       (unsigned long)diag_toolong, (unsigned long)diag_err,
+                       (unsigned long)diag_stuck);
             }
         }
     }
