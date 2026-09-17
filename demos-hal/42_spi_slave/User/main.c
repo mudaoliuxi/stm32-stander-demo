@@ -100,7 +100,11 @@
 /* 片选管理: 0=硬件NSS(PB12走AF5)  1=软件NSS(SSI恒0)
    ★ 默认1: 软件NSS是V1.4实测跑通的路径("之前接收是正确的"), 别默认开硬件NSS --
      那是V1.5的试验项, 上板未验证, 默认开着只会让问题更难定位。 */
-#define SPI_NSS_MODE            0
+/* V2.5: 0->1 退回软件NSS。
+ * 理由: 实测一次16字节传输会被拆成 2+14 / 3+14 帧 => NSS线上有毛刺上升沿。
+ * 硬件NSS模式下毛刺会复位SPI内部位计数器(固件无法拦截, 表现为双方向对称偏1位);
+ * 软件NSS模式下SPI位计数器不受NSS引脚影响, 配合EXTI去抖可完全免疫毛刺。 */
+#define SPI_NSS_MODE            1
 
 /* Master读走的应答内容: 16个 0xA5
    [!] 若心跳里 UDR 每帧+1, 说明 Master 读的字节数 >= 从机 TX 准备的长度,
@@ -146,6 +150,7 @@ volatile uint32_t g_spi_err_cnt     = 0;        /* SPI OVR/UDR/FRE 错误总数     
 volatile uint32_t g_spi_ovr_cnt     = 0;        /* RX FIFO 溢出 Overrun  (接收侧真故障, 该恒0)  */
 volatile uint32_t g_spi_udr_cnt     = 0;        /* TX FIFO 欠载 Underrun (从机TX给少了会这样)   */
 volatile uint32_t g_spi_fre_cnt     = 0;        /* 帧错误 TIFRE          (非TI模式应恒为0)      */
+volatile uint32_t g_spi_nss_glitch_cnt = 0;     /* NSS上升沿毛刺次数(EXTI触发时引脚已是低电平)  */
 
 static const char g_hex_tab[16] = "0123456789ABCDEF";
 
@@ -486,6 +491,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == SPI2_NSS_PIN)
     {
+        /* V2.5 去抖: 上升沿触发时读引脚实际电平, 若已回落为低则是毛刺, 忽略。
+         * 真帧结束: NSS 持续为高, 读到 SET, 正常切帧。 */
+        if (HAL_GPIO_ReadPin(SPI2_GPIO_PORT, SPI2_NSS_PIN) == GPIO_PIN_RESET)
+        {
+            g_spi_nss_glitch_cnt++;
+            return;
+        }
         spi_frame_close();
     }
 }
@@ -538,7 +550,7 @@ int main(void)
     usart_init(115200);                  /* 初始化串口1, 115200bps(打印用) */
     led_init();                          /* 初始化LED */
 
-    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.4 硬件NSS, 每帧重新对齐) =====\r\n");
+    printf("\r\n\r\n===== 正点原子 M100Z-M7 SPI2 Slave Demo (V2.5 软件NSS+EXTI去抖) =====\r\n");
     printf("系统时钟: 480MHz | SPI2内核时钟: PCLK1 = 120MHz\r\n");
     printf("接线: NSS=PB12, SCK=PB13, MISO=PB14, MOSI=PB15, 必须共地\r\n");
     printf("从机SPI模式: SPI_DEMO_MODE=%d (0=Mode0 1=Mode1 2=Mode2 3=Mode3), 须与Master一致\r\n",
@@ -616,9 +628,10 @@ int main(void)
         {
             tick_diag = HAL_GetTick();
 
-            printf("[心跳] %lu s | NSS=%lu 帧=%lu 空=%lu | 错 OVR=%lu UDR=%lu FRE=%lu | SPI_EN=%d\r\n",
+            printf("[心跳] %lu s | NSS=%lu 帧=%lu 空=%lu 毛刺=%lu | 错 OVR=%lu UDR=%lu FRE=%lu | SPI_EN=%d\r\n",
                    (unsigned long)(HAL_GetTick() / 1000UL), (unsigned long)g_spi_irq_cnt,
                    (unsigned long)diag_ok, (unsigned long)g_spi_drop_cnt,
+                   (unsigned long)g_spi_nss_glitch_cnt,
                    (unsigned long)g_spi_ovr_cnt, (unsigned long)g_spi_udr_cnt,
                    (unsigned long)g_spi_fre_cnt,
                    ((SPI2->CR1 & SPI_CR1_SPE) != 0UL) ? 1 : 0);
